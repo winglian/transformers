@@ -872,6 +872,7 @@ def pipeline(
 
         # Instantiate tokenizer if needed
         if isinstance(tokenizer, (str, tuple)):
+            print(tokenizer)
             if isinstance(tokenizer, tuple):
                 # For tuple we have (tokenizer name, {kwargs})
                 use_fast = tokenizer[1].pop("use_fast", use_fast)
@@ -882,6 +883,7 @@ def pipeline(
                 tokenizer_kwargs = model_kwargs.copy()
                 tokenizer_kwargs.pop("torch_dtype", None)
 
+            print(tokenizer_identifier)
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_identifier, use_fast=use_fast, _from_pipeline=task, **hub_kwargs, **tokenizer_kwargs
             )
