@@ -93,6 +93,7 @@ class LlamaTokenizer(PreTrainedTokenizer):
         self.add_bos_token = add_bos_token
         self.add_eos_token = add_eos_token
         self.sp_model = spm.SentencePieceProcessor(**self.sp_model_kwargs)
+        print(repr(vocab_file))
         self.sp_model.Load(vocab_file)
 
     def __getstate__(self):
