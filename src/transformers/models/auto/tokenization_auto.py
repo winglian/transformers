@@ -640,6 +640,7 @@ class AutoTokenizer:
 
         # Next, let's try to use the tokenizer_config file to get the tokenizer class.
         tokenizer_config = get_tokenizer_config(pretrained_model_name_or_path, **kwargs)
+        print("tokenizer_config: " + repr(tokenizer_config))
         if "_commit_hash" in tokenizer_config:
             kwargs["_commit_hash"] = tokenizer_config["_commit_hash"]
         config_tokenizer_class = tokenizer_config.get("tokenizer_class")
