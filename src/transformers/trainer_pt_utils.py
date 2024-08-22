@@ -1250,6 +1250,8 @@ class AcceleratorConfig:
             Whether or not to use a pre-configured `AcceleratorState` or `PartialState` defined
             before calling `TrainingArguments`. If `True`, an `Accelerator` or `PartialState`
             must be initialized. May lead to issues using sweeps or hyperparameter tuning.
+        fsdp_plugin (`FullyShardedDataParallelPlugin`, *optional*):
+            The FSDP configuration to use for FSDP training.
 
     """
 
@@ -1317,6 +1319,13 @@ class AcceleratorConfig:
         metadata={
             "help": "Whether or not to use a pre-configured `AcceleratorState` or `PartialState` defined before calling `TrainingArguments`."
             "If `True`, an `Accelerator` or `PartialState` must be initialized. May lead to issues using sweeps or hyperparameter tuning."
+        },
+    )
+
+    fsdp_plugin: Optional["FullyShardedDataParallelPlugin"] = field(
+        default=None,
+        metadata={
+            "help": "The FSDP configuration to use for FSDP training."
         },
     )
 
