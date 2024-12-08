@@ -2251,7 +2251,8 @@ class Trainer:
             else:
                 debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
-        delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled
+        delay_optimizer_creation = (is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled
+                                    or (self.is_fsdp_enabled and not args.fp8))
 
         # We need to reset the scheduler, as its parameters may be different on subsequent calls
         if self._created_lr_scheduler:
