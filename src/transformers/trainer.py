@@ -2081,7 +2081,9 @@ class Trainer:
             if is_torch_neuroncore_available():
                 return model
             kwargs = {}
-            if self.args.ddp_find_unused_parameters is not None:
+            if self.args.ddp_static_graph:
+                kwargs["static_graph"] = True
+            elif self.args.ddp_find_unused_parameters is not None:
                 kwargs["find_unused_parameters"] = self.args.ddp_find_unused_parameters
             elif isinstance(model, PreTrainedModel):
                 # find_unused_parameters breaks checkpointing as per

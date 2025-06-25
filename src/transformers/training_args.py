@@ -1328,6 +1328,15 @@ class TrainingArguments:
             )
         },
     )
+    ddp_static_graph: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "When using distributed training, the value of the flag `static_graph` passed to "
+                "`DistributedDataParallel`."
+            )
+        },
+    )
     dataloader_pin_memory: bool = field(
         default=True, metadata={"help": "Whether or not to pin memory for DataLoader."}
     )
