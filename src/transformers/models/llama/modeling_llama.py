@@ -17,6 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections import OrderedDict
 from typing import Callable, Optional, Union
 
 import torch
@@ -151,6 +152,24 @@ class LlamaMLP(nn.Module):
         return down_proj
 
 
+class LlamaFusedMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        gate_proj, up_proj = torch.chunk(self.gate_up_proj(x), 2, dim=-1)
+        down_proj = self.down_proj(self.act_fn(gate_proj) * up_proj)
+        return down_proj
+
+    # TODO handle unpacking state_dict and packing load_state_dict calls for weights and biases
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -260,15 +279,27 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
+    @property
+    def self_attn_cls(self):
+        return LlamaAttention
+
+    @property
+    def mlp_cls(self):
+        return LlamaMLP
+
+    @property
+    def rms_norm_cls(self):
+        return LlamaRMSNorm
+
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = self.self_attn_cls(config=config, layer_idx=layer_idx)
 
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = self.mlp_cls(config)
+        self.input_layernorm = self.rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = self.rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -339,6 +370,18 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
 @auto_docstring
 class LlamaModel(LlamaPreTrainedModel):
+    @property
+    def decoder_layer_cls(self):
+        return LlamaDecoderLayer
+
+    @property
+    def rms_norm_cls(self):
+        return LlamaRMSNorm
+
+    @property
+    def rotary_emb_cls(self):
+        return LlamaRotaryEmbedding
+
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -346,10 +389,10 @@ class LlamaModel(LlamaPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [self.decoder_layer_cls(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.norm = self.rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = self.rotary_emb_cls(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -428,9 +471,13 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @property
+    def model_cls(self):
+        return LlamaModel
+
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlamaModel(config)
+        self.model = self.model_cls(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
