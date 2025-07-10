@@ -796,9 +796,7 @@ def _load_state_dict_into_meta_model(
             hf_quantizer,
         )
 
-        if (
-            device_mesh is not None and device_map == "auto"
-        ):  # In this case, the param is already on the correct device!
+        if device_mesh is not None:  # In this case, the param is already on the correct device!
             # TODO: Fix this properly
             shard_and_distribute_module(
                 model,
@@ -4691,7 +4689,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                     "device_mesh must contain a 'tp' dimension"
                 )
                 device_mesh = device_mesh["tp"]
-                device_map = torch.device(device_mesh.device_type, int(os.environ["LOCAL_RANK"]))
                 tp_size = device_mesh["tp"].size()
 
             if tp_size is None:
@@ -5566,7 +5563,10 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         # Post-processing for tensor parallelism
         if device_mesh is not None:
             # When using TP, the device map is a single device for all parameters
-            tp_device = list(device_map.values())[0]
+            if device_map:
+                tp_device = list(device_map.values())[0]
+            else:
+                tp_device = torch.device(device_mesh.device_type, int(os.environ["LOCAL_RANK"]))
             # This is needed for the RotaryEmbedding, which was not initialized on the correct device as it is
             # not part of the state_dict (persistent=False)
             for buffer in model.buffers():
