@@ -410,6 +410,7 @@ flash_241 = is_flash_attn_greater_or_equal("2.4.1")
 deterministic_g = None
 
 
+@torch.compiler.disable(recursive=True)
 def _flash_attention_forward(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
