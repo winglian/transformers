@@ -4682,12 +4682,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         # We need to correctly dispatch the model on the current process device. The easiest way for this is to use a simple
         # `device_map` pointing to the correct device
         if tp_plan is not None:
-            if device_mesh is None and tp_plan is not None:
+            if device_mesh is None:
                 tp_plan, device_map, device_mesh = initialize_tensor_parallelism(tp_plan, tp_size=None)
             else:
-                assert device_mesh is not None and "tp" in device_mesh.mesh_dim_names, (
-                    "device_mesh must contain a 'tp' dimension"
-                )
+                if "tp" not in device_mesh.mesh_dim_names:
+                    raise ValueError("device_mesh must contain a 'tp' dimension")
                 device_mesh = device_mesh["tp"]
                 tp_size = device_mesh["tp"].size()
 
