@@ -3990,6 +3990,8 @@ class Trainer:
         elif self.args.should_save:
             self._save(output_dir)
 
+        # barrier here as not all ranks are used to save the model
+        dist.barrier()
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
             self.push_to_hub(commit_message="Model save", revision=self.args.hub_revision)
