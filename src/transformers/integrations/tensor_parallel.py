@@ -997,25 +997,17 @@ def add_tensor_parallel_hooks_to_module(
 
 
 def shard_and_distribute_module(
-    model, param, empty_param, parameter_name, param_casting_dtype, is_contiguous, rank, device_mesh, set_param=True
-):  # TODO: rename to shard_and_distribute_param
+        model, param, empty_param, parameter_name, param_casting_dtype, is_contiguous, rank, device_mesh, set_param=True
+):
     r"""
     This function is called in `from_pretrained` when loading a model's checkpoints.
     It receives the pointer to the parameter (or the parameter itself) and takes care of "sharding".
     All process run this function, so they just load the partition of the tensor that they require.
-
-    Main uses cases:
-    - column / rowise parallelism, you just shard all the weights of the layer (weight and bias)
-    - packed layers: you slice the weights, then shard like above
-    - custom operation:
-        - you want to add an all-gather at the end of a local layer.
-        - you want to have a layer that is isolated from the rest of the world (because torch.DTensor does not work well with `.view` for instance)
-
     """
     param_name, param_type = parameter_name.rsplit(".", 1) if "." in parameter_name else parameter_name
     tp_plan = model._tp_plan or {}
     tp_plan.update(getattr(type(model), "_tp_plan", None) or {})
-    module_to_tp = model.get_submodule(param_name)  # TODO: can i loop over modules?
+    module_to_tp = model.get_submodule(param_name)
     rank = int(rank)
     current_shard_plan = _get_parameter_tp_plan(parameter_name, tp_plan)
 
@@ -1025,11 +1017,34 @@ def shard_and_distribute_module(
         else:
             logger.info(f"Tensor sharding plan for {param_name}: {current_shard_plan}")
 
+    # Extract the TP device mesh if we have a multi-dimensional mesh
+    tp_device_mesh = device_mesh
+    tp_rank = rank
+
+    if device_mesh.ndim > 1:
+        # Find the TP dimension
+        tp_dim_name = None
+        for name in device_mesh.mesh_dim_names:
+            if 'tp' in name.lower():
+                tp_dim_name = name
+                break
+
+        if tp_dim_name is not None:
+            # Get only the TP slice of the device mesh
+            tp_device_mesh = device_mesh[tp_dim_name]
+            # Get the coordinate for this rank in the full mesh
+            coords = device_mesh.get_coordinate()
+            # Find the index of the TP dimension
+            tp_dim_idx = device_mesh.mesh_dim_names.index(tp_dim_name)
+            # Get the rank within the TP dimension
+            tp_rank = coords[tp_dim_idx] if coords is not None else rank
+
     if current_shard_plan is not None:
         try:
             tp_layer = ALL_PARALLEL_STYLES[current_shard_plan]
+            # Use TP rank and TP device mesh for partitioning
             param = tp_layer.partition_tensor(
-                param, empty_param, param_type, param_casting_dtype, is_contiguous, rank, device_mesh
+                param, empty_param, param_type, param_casting_dtype, is_contiguous, tp_rank, tp_device_mesh
             )
         except NotImplementedError as e:
             print(
@@ -1038,14 +1053,43 @@ def shard_and_distribute_module(
     else:
         param = param[:].to(param_casting_dtype)
 
+    # Now handle FSDP/DP distribution if we have a multi-dimensional mesh
+    if device_mesh.ndim > 1:
+        from torch.distributed.tensor import DTensor, Replicate, Shard, redistribute
+
+        # Determine placements for the full device mesh
+        placements = []
+        for dim_name in device_mesh.mesh_dim_names:
+            if 'tp' in dim_name.lower() and current_shard_plan is not None:
+                # This dimension was already handled by TP partitioning
+                # The placement depends on the TP strategy
+                if current_shard_plan in ['colwise', 'rowwise']:
+                    # Assuming colwise shards on dim 0, rowwise on dim 1
+                    shard_dim = 0 if current_shard_plan == 'colwise' else 1
+                    placements.append(Shard(shard_dim))
+                else:
+                    placements.append(Replicate())
+            else:
+                # FSDP/DP dimensions typically replicate the already-sharded tensor
+                placements.append(Replicate())
+
+        # Handle the case where param is already a DTensor from partition_tensor
+        if isinstance(param, DTensor):
+            # If it's already a DTensor with the TP mesh, we need to redistribute to full mesh
+            if param.device_mesh != device_mesh:
+                # Get the local tensor from the TP DTensor
+                local_tensor = param.to_local()
+                # Create a new DTensor with the full device mesh
+                param = DTensor.from_local(local_tensor, device_mesh, placements)
+        else:
+            # Convert regular tensor to DTensor with full device mesh
+            param = DTensor.from_local(param, device_mesh, placements)
+
     # SUPER IMPORTANT we have to use setattr
-    # otherwise loading is crazy slow
     if not isinstance(param, torch.nn.Parameter):
         param = torch.nn.Parameter(param, requires_grad=empty_param.is_floating_point())
     setattr(module_to_tp, param_type, param)
-    # module_to_tp.load_state_dict({param_type: param}, strict=False, assign=True)
     return param
-
 
 def verify_tp_plan(expected_keys: list[str], tp_plan: dict[str, str] | None):
     """

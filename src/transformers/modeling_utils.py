@@ -818,7 +818,7 @@ def _load_state_dict_into_meta_model(
                     param_name,
                     casting_dtype,
                     to_contiguous,
-                    device_mesh.get_local_rank(),
+                    device_mesh.get_local_rank("tp"),
                     device_mesh,
                 )
             else:  # we have a device mesh but the param needs to be quantized, so we shard inside create_quantized_param:
@@ -4693,8 +4693,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                             "When using `tp_plan` and n-d `device_mesh`, it must contain a 'tp' dimension. "
                             "Please provide a valid `device_mesh`."
                         )
+                    # TODO(wing): we should be able to not divide the mesh and simply handle this when sharding
                     device_mesh = device_mesh["tp"]
-                tp_size = device_mesh.size()
+                tp_size = device_mesh["tp"].size()
                 if device_map is None:
                     device_map = torch.device(f"{device_mesh.device_type}:{int(os.environ['LOCAL_RANK'])}")
 
@@ -5590,6 +5591,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                         continue
                     # Shard the param
                     to_contiguous, casting_dtype = _infer_parameter_dtype(model, name, param, keep_in_fp32_regex)
+                    print(device_mesh, device_mesh.get_local_rank())
                     shard_and_distribute_module(
                         model,
                         param.to(tp_device),

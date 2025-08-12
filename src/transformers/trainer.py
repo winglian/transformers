@@ -2387,9 +2387,12 @@ class Trainer:
                     model = self.accelerator.prepare(self.model)
                 else:
                     # We should avoid accelerate preparing the model in TP case since we dont need it as it is handled by transformers from_pretrained and also it goes into DDP based preparation.
-                    if self.is_tp_enabled:
+                    if self.is_tp_enabled and False:
                         self.optimizer = self.accelerator.prepare(self.optimizer)
                     else:
+                        self.accelerator.state.wait_for_everyone()
+                        print(os.environ["LOCAL_RANK"], "trainer_inner_train_loop")
+                        self.accelerator.state.wait_for_everyone()
                         model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
             else:
                 # to handle cases wherein we pass "DummyScheduler" such as when it is specified in DeepSpeed config.
@@ -5252,7 +5255,9 @@ class Trainer:
             args.update(accelerator_config)
         # tp is initialized at Accelerator init phase so
         # args should be prepared here
-        if hasattr(self.model, "tp_size") and self.model.tp_size is not None and self.model.tp_size > 1:
+        # TODO(wing): don't need to setup TorchTensorParallelPlugin when using FSDP2 + TP
+        if hasattr(self.model, "tp_size") and self.model.tp_size is not None and self.model.tp_size > 1 and False:
+            print(self.model.tp_size)
             self.is_tp_enabled = True
             if version.parse(accelerate_version) > version.parse("1.3.0"):
                 args["torch_tp_plugin"] = TorchTensorParallelPlugin(tp_size=self.model.tp_size)
