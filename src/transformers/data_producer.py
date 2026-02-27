@@ -240,6 +240,31 @@ class AsyncDataProducer:
         produced synchronously (on-policy) so the model can bootstrap
         learning from sparse reward signals before async prefetch begins.
         """
+        # --- DEBUG MODE: run everything synchronously ---
+        # _debug_no_thread=True: synchronous + skip_policy_logps=False
+        #   Tests the DataProducer data flow (RolloutDataset, shuffle, collator)
+        #   WITHOUT deferred logps.  If this works but async doesn't, the bug
+        #   is in the deferred logps / _compute_policy_logps path.
+        # _debug_no_thread="deferred": synchronous + skip_policy_logps=True
+        #   Tests deferred logps without threading.  If this fails too, the bug
+        #   is in _compute_policy_logps, not in threading.
+        _dnt = getattr(self, "_debug_no_thread", False)
+        if _dnt:
+            if _dnt == "deferred":
+                bg_kwargs = {**kwargs, **self._background_kwargs}
+                logger.info(
+                    "AsyncDataProducer: _debug_no_thread='deferred', producing synchronously "
+                    "with skip_policy_logps=%s",
+                    bg_kwargs.get("skip_policy_logps"),
+                )
+                return self._inner.produce(model, global_step, **bg_kwargs)
+            else:
+                logger.info(
+                    "AsyncDataProducer: _debug_no_thread=True, producing synchronously "
+                    "with skip_policy_logps=False (same as sync warmup)"
+                )
+                return self._inner.produce(model, global_step, **kwargs)
+
         # During warmup, produce synchronously (on-policy) without prefetching
         if self._warmup_remaining > 0:
             self._warmup_remaining -= 1
