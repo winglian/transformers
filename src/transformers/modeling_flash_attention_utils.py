@@ -32,7 +32,7 @@ from .utils import (
     logging,
 )
 from .utils.generic import split_attention_implementation
-from .utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING, is_tracing
+from .utils.import_utils import PACKAGE_DISTRIBUTION_MAPPING, is_env_variable_true, is_tracing
 
 
 logger = logging.get_logger(__name__)
@@ -434,7 +434,20 @@ def _upad_input(
     )
 
 
-def prepare_fa_kwargs_from_position_ids(position_ids):
+def _position_ids_cache_key(position_ids: torch.Tensor):
+    return (
+        position_ids.data_ptr(),
+        position_ids.device,
+        position_ids.dtype,
+        tuple(position_ids.shape),
+        tuple(position_ids.stride()),
+        position_ids._version,
+    )
+
+
+def prepare_fa_kwargs_from_position_ids(
+    position_ids: torch.Tensor,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """
     This function returns all the necessary kwargs to call `flash_attn_varlen_func` extracted from position_ids.
 
@@ -450,6 +463,14 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
             Maximum sequence length in batch (`max_seqlen_in_batch_q` for the target sequence i.e. query,
             `max_seqlen_in_batch_k` for the source sequence i.e. key/value).
     """
+    use_cache = not is_env_variable_true("TRANSFORMERS_DISABLE_FA_POSITION_IDS_CACHE")
+    if use_cache:
+        original_position_ids = position_ids
+        cache_key = _position_ids_cache_key(original_position_ids)
+        cached = getattr(original_position_ids, "_transformers_fa_position_ids_kwargs_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
     tensor_kwargs = {"dtype": torch.int32, "device": position_ids.device}
 
     position_ids = position_ids.reshape(-1)
@@ -469,7 +490,14 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
     max_length_q = cu_seq_lens_q.diff().max()
     max_length_k = max_length_q
 
-    return (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)
+    result = (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)
+    if use_cache:
+        try:
+            setattr(original_position_ids, "_transformers_fa_position_ids_kwargs_cache", (cache_key, result))
+        except AttributeError:
+            pass
+
+    return result
 
 
 def _prepare_from_posids(query, key, value, position_ids):
