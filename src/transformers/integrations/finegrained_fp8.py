@@ -176,6 +176,18 @@ def _alloc_expert_proj(
     return weight, sf
 
 
+def _alloc_expert_scale2(num_experts: int, halves: int = 1) -> nn.Parameter:
+    """Allocate an NVFP4 second-level per-tensor scale: one fp32 scalar per expert.
+
+    `halves=2` for a fused `gate_up_proj` — the gate (`w1`) and up (`w3`) halves are
+    independently scaled upstream, so their `weight_scale_2` values can't be assumed equal;
+    the result is `[2 * num_experts]`, gate experts first then up experts, matching the
+    order the weight/`weight_scale` halves are concatenated in.
+    """
+    t = torch.empty(halves * num_experts, dtype=torch.float32)
+    return nn.Parameter(t, requires_grad=t.is_floating_point())
+
+
 def finegrained_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -593,6 +605,8 @@ class FP8Experts(nn.Module):
         scale_fmt: str = "float",
         has_bias: bool = False,
         has_gate: bool = True,
+        moe_quant_algo: str | None = None,
+        moe_group_size: int | None = None,
     ):
         super().__init__()
 
@@ -618,8 +632,24 @@ class FP8Experts(nn.Module):
         #   - weight is `int8`, K dim halved (2 e2m1 values per byte).
         #   - per-row SF at gran_k=32 (no block-wise SF; `block_size` ignored).
         is_fp4 = getattr(config, "expert_dtype", "fp8") == "fp4"
+        # NVFP4 mixed-precision checkpoints (`moe_quant_algo="nvfp4"`) are a *different*,
+        # two-level FP4 format: a group-of-`moe_group_size` E4M3 `weight_scale` on top of the
+        # packed FP4 weight, PLUS a per-tensor fp32 `weight_scale_2` (see `Fp8Dequantize`).
+        # This is orthogonal to the single-level `expert_dtype == "fp4"` path above (which stays
+        # untouched) and only concerns loading/dequantizing — there is no quantized NVFP4 forward
+        # kernel here, so the extra scale is just carried as a plain parameter.
+        is_nvfp4 = moe_quant_algo is not None and moe_quant_algo.lower() == "nvfp4"
         sf_dtype = _get_ue8m0_dtype() if scale_fmt == "ue8m0" else torch.float32
-        if is_fp4:
+        if is_nvfp4:
+            group_size = moe_group_size if moe_group_size is not None else 16
+            alloc_kwargs = {
+                "weight_dtype": torch.int8,
+                "sf_dtype": _FP8_DTYPE,
+                "weight_k_div": 2,
+                "sf_gran_n": 1,
+                "sf_gran_k": group_size,
+            }
+        elif is_fp4:
             alloc_kwargs = {
                 "weight_dtype": torch.int8,
                 "sf_dtype": sf_dtype,
@@ -635,20 +665,33 @@ class FP8Experts(nn.Module):
                 "sf_gran_k": block_size[1] if block_size is not None else None,
             }
 
+        scale_attr = "scale" if is_nvfp4 else "scale_inv"
         if self.has_gate:
-            self.gate_up_proj, self.gate_up_proj_scale_inv = _alloc_expert_proj(
+            gate_up_proj, gate_up_proj_scale = _alloc_expert_proj(
                 self.num_experts, 2 * self.intermediate_dim, self.hidden_dim, min_sf_out=2, **alloc_kwargs
             )
+            self.gate_up_proj = gate_up_proj
+            setattr(self, f"gate_up_proj_{scale_attr}", gate_up_proj_scale)
+            if is_nvfp4:
+                self.gate_up_proj_scale_2 = _alloc_expert_scale2(self.num_experts, halves=2)
             self.register_parameter("gate_up_proj_bias", None)
         else:
-            self.up_proj, self.up_proj_scale_inv = _alloc_expert_proj(
+            up_proj, up_proj_scale = _alloc_expert_proj(
                 self.num_experts, self.intermediate_dim, self.hidden_dim, **alloc_kwargs
             )
+            self.up_proj = up_proj
+            setattr(self, f"up_proj_{scale_attr}", up_proj_scale)
+            if is_nvfp4:
+                self.up_proj_scale_2 = _alloc_expert_scale2(self.num_experts)
             self.register_parameter("up_proj_bias", None)
 
-        self.down_proj, self.down_proj_scale_inv = _alloc_expert_proj(
+        down_proj, down_proj_scale = _alloc_expert_proj(
             self.num_experts, self.hidden_dim, self.intermediate_dim, **alloc_kwargs
         )
+        self.down_proj = down_proj
+        setattr(self, f"down_proj_{scale_attr}", down_proj_scale)
+        if is_nvfp4:
+            self.down_proj_scale_2 = _alloc_expert_scale2(self.num_experts)
         self.register_parameter("down_proj_bias", None)
 
         if self.activation_scheme == "static":
@@ -788,6 +831,8 @@ def replace_with_fp8_linear(
                     scale_fmt=quantization_config.scale_fmt,
                     has_bias=has_bias,
                     has_gate=has_gate,
+                    moe_quant_algo=quantization_config.moe_quant_algo,
+                    moe_group_size=quantization_config.moe_group_size,
                 )
             elif type(module) is nn.Linear:
                 # Vanilla `nn.Linear` → standard FP8Linear swap.
@@ -917,21 +962,30 @@ class Fp8Dequantize(ConversionOps):
         index, dequantizes per-pair, and emits the dequantized list under the
         original *weight* key. Scale entries are dropped from the output so the
         remaining ops only see weights.
+
+        NVFP4 experts (``moe_quant_algo="nvfp4"``) ship a *two-level* scale instead:
+        a sibling ``*.weight_scale`` (group-16 E4M3) and a sibling ``*.weight_scale_2``
+        (per-tensor fp32). Both are detected the same way and multiplied in, per source
+        tensor, before any fuse/concat runs.
     """
 
     def __init__(self, hf_quantizer):
         self.hf_quantizer = hf_quantizer
 
-    def _scale_pattern_for(self, weight_pattern: str) -> str:
+    def _scale_pattern_for(self, weight_pattern: str, dotted_suffix: str = "weight_scale_inv") -> str:
         # Strip the optional ``$`` regex anchor so we can match the underlying name.
+        # `dotted_suffix` also drives the "flat" (no-dot) sibling name for expert-fused
+        # patterns, e.g. ``"weight_scale_inv"`` -> ``"..._scale_inv"``, ``"weight_scale_2"``
+        # -> ``"..._scale_2"``.
         anchored = weight_pattern.endswith("$")
         base = weight_pattern[:-1] if anchored else weight_pattern
+        flat_suffix = "_" + dotted_suffix.removeprefix("weight_")
         if base.endswith(".weight"):
-            scale = base[: -len(".weight")] + ".weight_scale_inv"
+            scale = base[: -len(".weight")] + f".{dotted_suffix}"
         elif base == "weight":
-            scale = "weight_scale_inv"
+            scale = dotted_suffix
         else:
-            scale = base + "_scale_inv"
+            scale = base + flat_suffix
         return scale + "$" if anchored else scale
 
     # E2M1 (FP4) value table — checkpoints sometimes ship MoE experts as packed FP4
@@ -949,7 +1003,11 @@ class Fp8Dequantize(ConversionOps):
         return unpacked.reshape(*packed.shape[:-1], 2 * packed.shape[-1])
 
     def _dequantize_one(
-        self, quantized: torch.Tensor, scales: torch.Tensor, output_dtype: torch.dtype | None = None
+        self,
+        quantized: torch.Tensor,
+        scales: torch.Tensor,
+        output_dtype: torch.dtype | None = None,
+        scale_2: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # FP4 path: int8 / float4_e2m1fn_x2 stores two nibbles per byte. Unpack to fp32
         # first so the rest of the routine sees a normal (rows, cols) float matrix.
@@ -991,7 +1049,12 @@ class Fp8Dequantize(ConversionOps):
         original_shape = quantized_fp32.shape
         q = quantized_fp32.reshape(-1, scale_rows, block_m, scale_cols, block_n)
         s = s_fp32.reshape(-1, scale_rows, scale_cols).unsqueeze(-1).unsqueeze(2)
-        return (q * s).to(output_dtype).reshape(original_shape)
+        dequantized = q * s
+        if scale_2 is not None:
+            # NVFP4 two-level scale: `scale` is the group-16 E4M3 grid handled above,
+            # `scale_2` is one extra fp32 per-tensor multiplier on top of it.
+            dequantized = dequantized * scale_2.to(torch.float32)
+        return dequantized.to(output_dtype).reshape(original_shape)
 
     def _get_target_dtype(self, model: torch.nn.Module | None, full_layer_name: str | None) -> torch.dtype | None:
         if model is None or full_layer_name is None:
@@ -1028,10 +1091,24 @@ class Fp8Dequantize(ConversionOps):
         # Generic chain path: dequantize every weight pattern that has a sibling scale.
         result: dict[str, list[torch.Tensor] | torch.Tensor] = {}
         for key, value in input_dict.items():
-            if "activation_scale" in key or "weight_scale_inv" in key:
+            # "weight_scale" also matches "weight_scale_inv" and "weight_scale_2" (both contain
+            # it as a substring), so this one check drops every scale flavor from the chain.
+            if "activation_scale" in key or "weight_scale" in key:
                 continue  # consumed by the dequant; drop from the chain
-            scale_key = self._scale_pattern_for(key)
-            if scale_key not in input_dict:
+            scale_inv_key = self._scale_pattern_for(key)
+            nvfp4_scale_key = self._scale_pattern_for(key, "weight_scale")
+            if scale_inv_key in input_dict:
+                scale_key, scale2_key = scale_inv_key, None
+            elif nvfp4_scale_key in input_dict:
+                # NVFP4 two-level scale: group-16 E4M3 `weight_scale` plus a per-tensor fp32
+                # `weight_scale_2`. Both siblings are still per-source-tensor lists at this
+                # point (one entry per expert), i.e. *before* `MergeModulelist`/`Concatenate`
+                # fuse e.g. the gate (`w1`) and up (`w3`) halves — so each half's own
+                # `weight_scale_2` is applied to its own weights right here, never assuming
+                # the two halves share the same scalar.
+                scale_key = nvfp4_scale_key
+                scale2_key = self._scale_pattern_for(key, "weight_scale_2")
+            else:
                 # No scale to apply (e.g. unrelated entry) — pass through untouched.
                 result[key] = value
                 continue
@@ -1043,7 +1120,20 @@ class Fp8Dequantize(ConversionOps):
                     f"Fp8Dequantize: weight/scale count mismatch for {key} "
                     f"({len(weights)} weights vs {len(scales)} scales)."
                 )
-            result[key] = [self._dequantize_one(w, s, output_dtype=output_dtype) for w, s in zip(weights, scales)]
+            if scale2_key is not None and scale2_key in input_dict:
+                scales_2 = input_dict[scale2_key]
+                scales_2 = scales_2 if isinstance(scales_2, list) else [scales_2]
+                if len(weights) != len(scales_2):
+                    raise ValueError(
+                        f"Fp8Dequantize: weight/scale_2 count mismatch for {key} "
+                        f"({len(weights)} weights vs {len(scales_2)} scale_2)."
+                    )
+                result[key] = [
+                    self._dequantize_one(w, s, output_dtype=output_dtype, scale_2=s2)
+                    for w, s, s2 in zip(weights, scales, scales_2)
+                ]
+            else:
+                result[key] = [self._dequantize_one(w, s, output_dtype=output_dtype) for w, s in zip(weights, scales)]
         return result
 
     @property

@@ -1652,6 +1652,16 @@ class FineGrainedFP8Config(QuantizationConfigMixin):
         scale_fmt (`str`, *optional*, defaults to `"float"`):
             Storage dtype of the per-block weight scales: `"float"` (fp32, V3-style) or
             `"ue8m0"` (1-byte `torch.float8_e8m0fnu`, V4-style).
+        moe_quant_algo (`str`, *optional*):
+            Quantization algorithm used for the routed MoE experts, when it differs from the
+            blockwise-FP8 scheme used everywhere else (mixed-precision checkpoints). Only
+            `"nvfp4"` is currently supported: FP4-packed expert weights with a two-level scale
+            (a group-of-`moe_group_size` E4M3 `weight_scale` plus a per-tensor fp32
+            `weight_scale_2`). Leave unset for a checkpoint whose experts share the model-global
+            FP8 scheme.
+        moe_group_size (`int`, *optional*, defaults to 16):
+            Group size of the NVFP4 expert `weight_scale`, i.e. how many elements along the
+            input/hidden dimension share one E4M3 scale. Only used when `moe_quant_algo` is set.
     """
 
     def __init__(
@@ -1661,6 +1671,8 @@ class FineGrainedFP8Config(QuantizationConfigMixin):
         dequantize: bool = False,
         modules_to_not_convert: list | None = None,
         scale_fmt: str = "float",
+        moe_quant_algo: str | None = None,
+        moe_group_size: int | None = None,
         **kwargs,
     ):
         self.quant_method = kwargs.pop("quant_method", QuantizationMethod.FP8)
@@ -1672,6 +1684,13 @@ class FineGrainedFP8Config(QuantizationConfigMixin):
         self.weight_block_size = weight_block_size
         self.dequantize = dequantize
         self.scale_fmt = scale_fmt
+        # Mixed-precision (e.g. DeepSeek-V4-Flash-style) checkpoints ship the routed-expert
+        # quantization algorithm under a plain `group_size` key alongside `moe_quant_algo`;
+        # accept it as an alias for `moe_group_size` so the raw checkpoint dict round-trips.
+        if moe_group_size is None and "group_size" in kwargs:
+            moe_group_size = kwargs.pop("group_size")
+        self.moe_quant_algo = moe_quant_algo
+        self.moe_group_size = moe_group_size
         self.post_init()
 
     def post_init(self):
@@ -1687,6 +1706,16 @@ class FineGrainedFP8Config(QuantizationConfigMixin):
             raise ValueError("weight_block_size must be a tuple of two positive integers")
         if self.scale_fmt not in ("float", "ue8m0"):
             raise ValueError(f"scale_fmt must be 'float' or 'ue8m0'; got {self.scale_fmt!r}")
+        if self.moe_quant_algo is not None:
+            self.moe_quant_algo = self.moe_quant_algo.lower()
+            if self.moe_quant_algo != "nvfp4":
+                raise ValueError(
+                    f"moe_quant_algo={self.moe_quant_algo!r} is not supported; only 'nvfp4' is currently implemented."
+                )
+            if self.moe_group_size is None:
+                self.moe_group_size = 16
+            elif not isinstance(self.moe_group_size, int) or self.moe_group_size <= 0:
+                raise ValueError("moe_group_size must be a positive integer")
 
     def get_loading_attributes(self):
         return {"dequantize": self.dequantize, "modules_to_not_convert": self.modules_to_not_convert}

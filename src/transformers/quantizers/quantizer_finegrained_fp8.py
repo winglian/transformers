@@ -225,6 +225,23 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
             ]
         return []
 
+    @property
+    def _is_nvfp4_experts(self) -> bool:
+        return (
+            getattr(self.quantization_config, "moe_quant_algo", None) is not None
+            and self.quantization_config.moe_quant_algo.lower() == "nvfp4"
+        )
+
+    @staticmethod
+    def _is_expert_weight_converter(conv) -> bool:
+        # Every model-specific expert-fusion converter (DeepSeek-V4's `w1`/`w3` -> `gate_up_proj`,
+        # GraniteMoe's `gate_proj`/`up_proj` -> `gate_up_proj`, etc.) targets an `experts.<name>`
+        # path, regardless of the upstream leaf naming or how deep it's nested — a safe,
+        # model-agnostic hook to scope the NVFP4-only scale handling below to *just* the expert
+        # converters. Split on "." rather than a substring check so a target with no module
+        # prefix at all (e.g. a bare "experts.gate_up_proj") is still recognized.
+        return any("experts" in p.split(".")[:-1] for p in conv._original_target_patterns)
+
     def update_weight_conversions(self, weight_conversions):
         """When loading with ``dequantize=True``, attach an :class:`Fp8Dequantize` op to
         every existing :class:`WeightConverter` so that per-block scales are folded into
@@ -239,6 +256,11 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
              *same* converter bucket (both keys rewrite to the same target);
           3. prepend a fresh :class:`Fp8Dequantize` op so dequant runs first, before
              any merge/concat collapses the per-expert structure.
+
+        For NVFP4 experts (``moe_quant_algo="nvfp4"``), step 2 collects ``*.weight_scale``
+        (group-16 E4M3) and ``*.weight_scale_2`` (per-tensor fp32) instead — there is no
+        ``weight_scale_inv`` on an NVFP4 checkpoint — but the mechanism (and step 3) is
+        otherwise identical: everything still funnels into `Fp8Dequantize`.
 
         The generic ``weight$ + weight_scale_inv → weight`` converter from
         :meth:`get_weight_conversions` is still appended at the end as a fallback for
@@ -256,6 +278,8 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
         weight_conversions = [scale_rename] + list(weight_conversions)
 
         if not (self.pre_quantized and self.quantization_config.dequantize):
+            if self._is_nvfp4_experts:
+                weight_conversions = self._add_nvfp4_expert_scale_conversions(weight_conversions)
             return weight_conversions + self.get_weight_conversions()
 
         updated: list = []
@@ -268,8 +292,12 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
             weight_sources = [p for p in conv.source_patterns if p.endswith(".weight")]
             if weight_sources:
                 anchored_weight = [p + "$" for p in weight_sources]
-                scale_sources = [p[: -len(".weight")] + ".weight_scale_inv$" for p in weight_sources]
                 other = [p for p in conv.source_patterns if not p.endswith(".weight")]
+                if self._is_nvfp4_experts and self._is_expert_weight_converter(conv):
+                    scale_sources = [p[: -len(".weight")] + ".weight_scale$" for p in weight_sources]
+                    scale_sources += [p[: -len(".weight")] + ".weight_scale_2$" for p in weight_sources]
+                else:
+                    scale_sources = [p[: -len(".weight")] + ".weight_scale_inv$" for p in weight_sources]
                 new_sources = anchored_weight + scale_sources + other
                 new_ops = [Fp8Dequantize(self)] + list(conv.operations)
                 conv = WeightConverter(
@@ -280,4 +308,63 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
             updated.append(conv)
         # Generic fallback for plain ``nn.Linear`` weights with no model-specific converter.
         updated.extend(self.get_weight_conversions())
+        return updated
+
+    def _add_nvfp4_expert_scale_conversions(self, weight_conversions):
+        """``dequantize=False`` counterpart of the anchor-and-twin logic above: keep the
+        quantized (weight, scale, scale_2) triple as three separate model parameters instead
+        of folding them together, so build three separate converters per expert projection.
+
+        For every expert-fusion converter with ``.weight`` sources:
+          1. re-emit it unchanged except the sources are anchored with ``$`` (same reasoning
+             as the dequantize path — an unanchored ``*.weight`` would also swallow the
+             sibling scale keys via `re.search`, and reusing its op chain on scale data
+             breaks: `Concatenate(dim=1)` has no meaning once `MergeModulelist` already
+             reduced a 0-D-per-expert scalar to a 1-D `[num_experts]` vector);
+          2. add a twin targeting ``*_scale`` for the sibling ``*.weight_scale`` sources,
+             reusing the exact same op chain — the group-16 E4M3 scale has the same
+             ``(num_experts, out, in)`` shape as the weight, so it fuses along the same dims;
+          3. add a twin targeting ``*_scale_2`` for the sibling ``*.weight_scale_2`` sources,
+             using ``MergeModulelist(dim=0)`` (stack per expert) and, only when the weight
+             itself has two source patterns (a fused `gate_up_proj`-style projection),
+             ``Concatenate(dim=0)`` — the two independent per-expert scalars (e.g. `w1`'s and
+             `w3`'s) end up concatenated `[2 * num_experts]`, matching `FP8Experts`' allocation.
+        """
+        from ..core_model_loading import Concatenate, MergeModulelist, WeightConverter
+
+        updated: list = []
+        for conv in weight_conversions:
+            if not isinstance(conv, WeightConverter) or not self._is_expert_weight_converter(conv):
+                updated.append(conv)
+                continue
+            weight_sources = [p for p in conv.source_patterns if p.endswith(".weight")]
+            if not weight_sources:
+                updated.append(conv)
+                continue
+            other = [p for p in conv.source_patterns if not p.endswith(".weight")]
+            target = conv._original_target_patterns[0]
+            updated.append(
+                WeightConverter(
+                    source_patterns=[p + "$" for p in weight_sources] + other,
+                    target_patterns=conv._original_target_patterns,
+                    operations=list(conv.operations),
+                )
+            )
+            updated.append(
+                WeightConverter(
+                    source_patterns=[p[: -len(".weight")] + ".weight_scale$" for p in weight_sources],
+                    target_patterns=f"{target}_scale",
+                    operations=list(conv.operations),
+                )
+            )
+            scale_2_ops = (
+                [MergeModulelist(dim=0)] if len(weight_sources) == 1 else [MergeModulelist(dim=0), Concatenate(dim=0)]
+            )
+            updated.append(
+                WeightConverter(
+                    source_patterns=[p[: -len(".weight")] + ".weight_scale_2$" for p in weight_sources],
+                    target_patterns=f"{target}_scale_2",
+                    operations=scale_2_ops,
+                )
+            )
         return updated
